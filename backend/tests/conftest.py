@@ -10,6 +10,15 @@ from __future__ import annotations
 
 import os
 
+import email_validator
+
+# Tests use addresses on the `.test` TLD (RFC 2606 reserved for exactly this
+# purpose). email-validator treats `.test` as a special-use domain and
+# rejects it by default; it exposes this exact flag to opt back in for
+# automated test suites. Must be set before `app.*` is imported (pydantic's
+# EmailStr resolves email-validator's behaviour at import/validation time).
+email_validator.TEST_ENVIRONMENT = True
+
 # Must be set before `app.*` is imported anywhere: app/db/session.py binds a
 # module-level engine at import time. Pointing the *default* engine at a
 # throwaway in-memory SQLite database (rather than a `./sentineliq.db` file)
