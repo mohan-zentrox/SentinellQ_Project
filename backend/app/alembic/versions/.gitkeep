@@ -1,0 +1,5 @@
+Migrations are generated via `alembic revision --autogenerate -m "..."` once
+a target Postgres database is configured (SENTINELIQ_DATABASE_URL). Local
+dev and the pytest suite bootstrap schema directly from the SQLAlchemy
+models via Base.metadata.create_all() in app/main.py's lifespan hook, so no
+migration files are required to run this repo locally.

@@ -1,0 +1,73 @@
+# Local development stack.
+#
+# Only the services below are actually run here: PostgreSQL (metadata DB +
+# the Postgres-backed telemetry store adapter), Redis (available for the
+# optional RedisQueueBackend -- the default queue backend is in-process and
+# needs no service at all), the FastAPI backend, and the Vite/React frontend.
+#
+# ClickHouse/OpenSearch (documented target telemetry store), Kafka/Redpanda
+# (documented target streaming platform), and Stripe (documented target
+# billing provider) are NOT run here -- they are documented future swap-ins
+# behind the TelemetryStore, QueueBackend, and BillingProvider interfaces in
+# backend/app/services/. Local dev and CI use the working-default adapters
+# (Postgres-backed telemetry store, in-process/Redis queue, mocked Stripe)
+# so the whole stack runs with nothing beyond what's declared here.
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentineliq
+      POSTGRES_PASSWORD: sentineliq
+      POSTGRES_DB: sentineliq
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentineliq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      SENTINELIQ_DATABASE_URL: postgresql+psycopg2://sentineliq:sentineliq@postgres:5432/sentineliq
+      SENTINELIQ_QUEUE_BACKEND: in_process
+      SENTINELIQ_REDIS_URL: redis://redis:6379/0
+      SENTINELIQ_JWT_SECRET: dev-only-secret-change-me
+      SENTINELIQ_BILLING_PROVIDER: mock_stripe
+      SENTINELIQ_CORS_ORIGINS: '["http://localhost:5173"]'
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/v1
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
