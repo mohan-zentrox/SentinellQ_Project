@@ -1,32 +1,35 @@
-"""FM8 (aggregations part): tenant-scoped KPI aggregation.
+"""FM8: tenant-scoped analytics endpoints.
 
-- alertVolume: count of alerts raised in the period.
-- falsePositiveRate: placeholder until analyst feedback / ML confidence
-  scoring exists (FM8 full scope + C8 ML scaffold) -- computed here as the
-  share of alerts explicitly marked "dismissed", defaulting to 0.0 when
-  there's no dismissal data yet, and clearly documented as a placeholder
-  metric, not a validated false-positive model.
-- mttdSeconds: mean time-to-detect = avg(alert.created_at - earliest
-  contributing event.occurred_at), across alerts in the period.
-- mttrSeconds: mean time-to-resolve = avg(resolved_at - created_at) for
-  cases resolved in the period, derived from CaseTimelineEntry timestamps.
+The aggregation arithmetic lives in `app/services/analytics.py` so FM9's
+compliance reports compute identical numbers from identical code -- see that
+module for the metric definitions and the timezone-coercion rationale.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
 from app.db.session import get_db
-from app.models.alert import Alert
-from app.models.case import Case, CaseStatus
-from app.models.event import Event
+from app.models.rule import DetectionRule
 from app.models.user import User
-from app.schemas.analytics import KPIResponse
+from app.schemas.analytics import (
+    AlertTimeseriesResponse,
+    DetectionCoverageResponse,
+    KPIResponse,
+    TimeseriesBucket,
+)
+from app.services.analytics import alert_volume_timeseries, compute_kpis
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+
+def _period(days: int) -> tuple[datetime, datetime]:
+    end = datetime.now(timezone.utc)
+    return end - timedelta(days=days), end
 
 
 @router.get("/kpis", response_model=KPIResponse)
@@ -35,79 +38,123 @@ def get_kpis(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> KPIResponse:
-    period_end = datetime.now(timezone.utc)
-    period_start = period_end - timedelta(days=days)
+    start, end = _period(days)
+    return KPIResponse(**compute_kpis(db, tenant_id=current_user.tenant_id, period_start=start, period_end=end))
 
-    alerts = (
-        db.query(Alert)
-        .filter(
-            Alert.tenant_id == current_user.tenant_id,
-            Alert.created_at >= period_start,
-            Alert.created_at <= period_end,
+
+@router.get("/alerts/timeseries", response_model=AlertTimeseriesResponse)
+def get_alert_timeseries(
+    days: int = Query(default=14, ge=1, le=365),
+    bucket_hours: int = Query(default=24, ge=1, le=168, alias="bucketHours"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AlertTimeseriesResponse:
+    """Bucketed alert volume for the dashboard trend chart."""
+    start, end = _period(days)
+    buckets = alert_volume_timeseries(
+        db,
+        tenant_id=current_user.tenant_id,
+        period_start=start,
+        period_end=end,
+        bucket_hours=bucket_hours,
+    )
+    return AlertTimeseriesResponse(
+        period_start=start,
+        period_end=end,
+        bucket_hours=bucket_hours,
+        buckets=[TimeseriesBucket(**bucket) for bucket in buckets],
+    )
+
+
+@router.get("/detection-coverage", response_model=DetectionCoverageResponse)
+def get_detection_coverage(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DetectionCoverageResponse:
+    """Which rules are producing findings, and which have never fired.
+
+    A rule that has never matched is either mis-authored or covers a threat this
+    tenant has not seen. Both are actionable and the distinction matters, so this
+    reports the raw fact rather than guessing which it is.
+    """
+    rules = list(
+        db.execute(select(DetectionRule).where(DetectionRule.tenant_id == current_user.tenant_id)).scalars()
+    )
+    enabled = [rule for rule in rules if rule.is_enabled]
+    with_matches = [rule for rule in rules if (rule.match_count or 0) > 0]
+
+    never_matched = [
+        {
+            "ruleId": rule.id,
+            "name": rule.name,
+            "severity": rule.severity,
+            "isEnabled": rule.is_enabled,
+            "lastEvaluatedAt": rule.last_evaluated_at.isoformat() if rule.last_evaluated_at else None,
+        }
+        for rule in rules
+        if (rule.match_count or 0) == 0
+    ]
+    top = sorted(with_matches, key=lambda r: -(r.match_count or 0))[:10]
+
+    return DetectionCoverageResponse(
+        total_rules=len(rules),
+        enabled_rules=len(enabled),
+        rules_with_matches=len(with_matches),
+        never_matched_rules=never_matched[:25],
+        top_rules=[
+            {
+                "ruleId": rule.id,
+                "name": rule.name,
+                "severity": rule.severity,
+                "matchCount": rule.match_count or 0,
+                "lastMatchedAt": rule.last_matched_at.isoformat() if rule.last_matched_at else None,
+            }
+            for rule in top
+        ],
+    )
+
+
+@router.get("/ingestion", response_model=dict)
+def get_ingestion_stats(
+    days: int = Query(default=7, ge=1, le=90),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Telemetry volume by source and severity.
+
+    [2]'s data-engineering view: which connectors are actually delivering, and
+    whether the severity mix suddenly shifted (a common sign a log source
+    changed format and normalization is now mis-mapping it).
+    """
+    from app.models.event import Event
+
+    start, end = _period(days)
+    by_source = db.execute(
+        select(Event.source, func.count())
+        .where(Event.tenant_id == current_user.tenant_id, Event.occurred_at >= start, Event.occurred_at <= end)
+        .group_by(Event.source)
+    ).all()
+    by_severity = db.execute(
+        select(Event.severity_hint, func.count())
+        .where(Event.tenant_id == current_user.tenant_id, Event.occurred_at >= start, Event.occurred_at <= end)
+        .group_by(Event.severity_hint)
+    ).all()
+    enriched = db.execute(
+        select(func.count())
+        .select_from(Event)
+        .where(
+            Event.tenant_id == current_user.tenant_id,
+            Event.occurred_at >= start,
+            Event.enrichment.isnot(None),
         )
-        .all()
-    )
-    alert_volume = len(alerts)
+    ).scalar_one()
 
-    dismissed = sum(1 for a in alerts if a.status == "dismissed")
-    false_positive_rate = (dismissed / alert_volume) if alert_volume else 0.0
-
-    # MTTD: for each alert, look up the earliest occurred_at among its
-    # contributing events and diff against the alert's created_at.
-    mttd_samples: list[float] = []
-    for alert in alerts:
-        if not alert.event_ids:
-            continue
-        earliest = (
-            db.query(Event.occurred_at)
-            .filter(Event.tenant_id == current_user.tenant_id, Event.id.in_(alert.event_ids))
-            .order_by(Event.occurred_at.asc())
-            .first()
-        )
-        if earliest is None:
-            continue
-        occurred_at = earliest[0]
-        if occurred_at.tzinfo is None:
-            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-        created_at = alert.created_at if alert.created_at.tzinfo else alert.created_at.replace(tzinfo=timezone.utc)
-        delta = (created_at - occurred_at).total_seconds()
-        if delta >= 0:
-            mttd_samples.append(delta)
-    mttd_seconds = (sum(mttd_samples) / len(mttd_samples)) if mttd_samples else None
-
-    resolved_cases = (
-        db.query(Case)
-        .filter(
-            Case.tenant_id == current_user.tenant_id,
-            Case.status == CaseStatus.RESOLVED,
-            Case.resolved_at.isnot(None),
-            Case.resolved_at >= period_start,
-            Case.resolved_at <= period_end,
-        )
-        .all()
-    )
-    mttr_samples: list[float] = []
-    for case in resolved_cases:
-        created_at = case.created_at if case.created_at.tzinfo else case.created_at.replace(tzinfo=timezone.utc)
-        resolved_at = case.resolved_at if case.resolved_at.tzinfo else case.resolved_at.replace(tzinfo=timezone.utc)
-        delta = (resolved_at - created_at).total_seconds()
-        if delta >= 0:
-            mttr_samples.append(delta)
-    mttr_seconds = (sum(mttr_samples) / len(mttr_samples)) if mttr_samples else None
-
-    open_cases = (
-        db.query(Case)
-        .filter(Case.tenant_id == current_user.tenant_id, Case.status != CaseStatus.RESOLVED)
-        .count()
-    )
-
-    return KPIResponse(
-        period_start=period_start,
-        period_end=period_end,
-        alert_volume=alert_volume,
-        false_positive_rate=round(false_positive_rate, 4),
-        mttd_seconds=mttd_seconds,
-        mttr_seconds=mttr_seconds,
-        open_cases=open_cases,
-        resolved_cases=len(resolved_cases),
-    )
+    total = sum(count for _, count in by_source)
+    return {
+        "periodStart": start.isoformat(),
+        "periodEnd": end.isoformat(),
+        "totalEvents": total,
+        "enrichedEvents": int(enriched),
+        "bySource": {source: count for source, count in by_source},
+        "bySeverity": {severity: count for severity, count in by_severity},
+    }

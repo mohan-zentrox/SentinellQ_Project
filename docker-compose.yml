@@ -1,18 +1,30 @@
 # Local development stack.
 #
-# Only the services below are actually run here: PostgreSQL (metadata DB +
-# the Postgres-backed telemetry store adapter), Redis (available for the
-# optional RedisQueueBackend -- the default queue backend is in-process and
-# needs no service at all), the FastAPI backend, and the Vite/React frontend.
+# Services actually run here: PostgreSQL (metadata DB + the Postgres-backed
+# telemetry store adapter), Redis (queue backend for the API -> worker hop),
+# the FastAPI backend, the ingestion worker, and the nginx-served React
+# frontend.
 #
 # ClickHouse/OpenSearch (documented target telemetry store), Kafka/Redpanda
 # (documented target streaming platform), and Stripe (documented target
 # billing provider) are NOT run here -- they are documented future swap-ins
 # behind the TelemetryStore, QueueBackend, and BillingProvider interfaces in
-# backend/app/services/. Local dev and CI use the working-default adapters
-# (Postgres-backed telemetry store, in-process/Redis queue, mocked Stripe)
-# so the whole stack runs with nothing beyond what's declared here.
-version: "3.9"
+# backend/app/services/, each selected by a SENTINELIQ_* setting that the
+# factory functions actually read.
+#
+# Schema is applied by backend/docker-entrypoint.sh (`alembic upgrade head`)
+# on container start; nothing here relies on Base.metadata.create_all().
+
+x-backend-env: &backend-env
+  SENTINELIQ_DATABASE_URL: postgresql+psycopg2://sentineliq:sentineliq@postgres:5432/sentineliq
+  SENTINELIQ_AUTO_CREATE_SCHEMA: "false"
+  SENTINELIQ_TELEMETRY_STORE_BACKEND: postgres
+  SENTINELIQ_QUEUE_BACKEND: redis
+  SENTINELIQ_REDIS_URL: redis://redis:6379/0
+  SENTINELIQ_JWT_SECRET: dev-only-secret-change-me
+  SENTINELIQ_BILLING_PROVIDER: mock_stripe
+  SENTINELIQ_CORS_ORIGINS: '["http://localhost:5173"]'
+  SENTINELIQ_LOG_FORMAT: json
 
 services:
   postgres:
@@ -44,13 +56,7 @@ services:
   backend:
     build:
       context: ./backend
-    environment:
-      SENTINELIQ_DATABASE_URL: postgresql+psycopg2://sentineliq:sentineliq@postgres:5432/sentineliq
-      SENTINELIQ_QUEUE_BACKEND: in_process
-      SENTINELIQ_REDIS_URL: redis://redis:6379/0
-      SENTINELIQ_JWT_SECRET: dev-only-secret-change-me
-      SENTINELIQ_BILLING_PROVIDER: mock_stripe
-      SENTINELIQ_CORS_ORIGINS: '["http://localhost:5173"]'
+    environment: *backend-env
     ports:
       - "8000:8000"
     depends_on:
@@ -59,15 +65,33 @@ services:
       redis:
         condition: service_healthy
 
+  # Consumes the raw-events topic the API publishes to, normalizes, persists,
+  # and runs detection. Shares the backend image; only the command differs.
+  worker:
+    build:
+      context: ./backend
+    environment: *backend-env
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
   frontend:
     build:
       context: ./frontend
-    environment:
-      VITE_API_BASE_URL: http://localhost:8000/v1
+      args:
+        # Same-origin path; nginx.conf proxies /v1/ -> backend:8000. Override
+        # with an absolute URL when the API lives on another host.
+        VITE_API_BASE_URL: /v1
     ports:
       - "5173:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

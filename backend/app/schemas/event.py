@@ -28,13 +28,29 @@ class EventOut(CamelModel):
     actor: str | None
     target: str | None
     source_ip: str | None
+    #: FM5 threat-intel annotation; null when the event has not been enriched.
+    enrichment: dict[str, Any] | None = None
     occurred_at: datetime
     ingested_at: datetime
+
+
+class EventDetailOut(EventOut):
+    """Event detail view: adds the raw and normalized documents, which are too
+    heavy to include in a 200-row list response."""
+
+    raw_payload: dict[str, Any]
+    normalized: dict[str, Any]
 
 
 class EventIngestResponse(CamelModel):
     accepted: int
     event_ids: list[str]
+    alerts_created: int = 0
+    #: "synchronous" -- the batch was normalized, stored and evaluated during
+    #: this request, and `eventIds` is populated.
+    #: "queued" -- the batch was enqueued for app/worker.py; `eventIds` is
+    #: empty and clients must not treat the 202 as "stored".
+    processing: str = "synchronous"
 
 
 class EventListResponse(PaginatedResponse):

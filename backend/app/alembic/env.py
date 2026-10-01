@@ -1,9 +1,13 @@
 """Alembic environment.
 
-Note: for local dev and the pytest suite, app/main.py's lifespan hook calls
-Base.metadata.create_all() directly (SQLite-friendly, zero-migration
-bootstrap). Alembic is the real migration path for Postgres environments
-(staging/prod) where schema changes must be versioned and reviewed.
+Alembic is the single source of truth for schema in every environment that
+isn't a throwaway. `app/main.py` only falls back to
+`Base.metadata.create_all()` when `settings.auto_create_schema` is true
+(the default for SQLite dev/test); container deploys run
+`alembic upgrade head` from `docker-entrypoint.sh` before uvicorn starts.
+
+`render_as_batch=True` keeps generated migrations runnable on SQLite, which
+does not support most bare `ALTER TABLE` forms.
 """
 from __future__ import annotations
 
@@ -12,9 +16,9 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from app import models  # noqa: F401  ensures all models are registered on Base.metadata
 from app.core.config import get_settings
 from app.db.base import Base
-from app import models  # noqa: F401  ensures all models are registered on Base.metadata
 
 config = context.config
 if config.config_file_name is not None:
@@ -28,7 +32,14 @@ target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
-    context.configure(url=url, target_metadata=target_metadata, literal_binds=True, dialect_opts={"paramstyle": "named"})
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        compare_type=True,
+        render_as_batch=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
@@ -36,7 +47,12 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     connectable = engine_from_config(config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool)
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            render_as_batch=connection.dialect.name == "sqlite",
+        )
         with context.begin_transaction():
             context.run_migrations()
 

@@ -34,3 +34,19 @@ Thumbs.db
 
 # --- Docker ---
 *.pid
+
+# --- Build artifacts emitted by `npm run build` / `tsc -b` ---
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# --- Generated runtime artifacts (ML models, compliance reports) ---
+var/
+backend/var/
+backend/_migscratch.db
+backend/_chk.db
+
+# --- Test coverage ---
+coverage/
+.coverage
+frontend/coverage/

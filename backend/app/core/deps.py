@@ -9,20 +9,44 @@ and which tenant do they belong to."
 """
 from __future__ import annotations
 
-import hashlib
-
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWTError
 from sqlalchemy.orm import Session
 
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, hash_opaque_token
 from app.db.session import get_db
-from app.models.billing import Plan, UsageCounter
+from app.models.billing import Plan
 from app.models.tenant import ServiceToken, Tenant
 from app.models.user import ROLE_HIERARCHY, Role, User
+from app.services.billing_meter import current_period, ensure_counter, read_event_usage
+
+__all__ = [
+    "client_ip",
+    "current_period",
+    "enforce_ingest_quota",
+    "get_current_user",
+    "get_tenant_from_service_token",
+    "hash_service_token",
+    "require_role",
+]
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def client_ip(request: Request) -> str:
+    """Best-effort client IP for rate limiting and audit rows.
+
+    Trusts `X-Forwarded-For`'s first hop, which is correct behind the nginx
+    proxy in this stack and *spoofable* if the API is exposed directly. That
+    tradeoff is acceptable for rate limiting (worst case: an attacker rotates
+    the key and gets the un-limited behaviour we had before) and is noted here
+    so nobody mistakes it for an authenticated identity.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
 
 
 def get_current_user(
@@ -36,6 +60,10 @@ def get_current_user(
     except PyJWTError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token") from exc
 
+    if payload.get("type") != "access":
+        # A refresh token must not be usable as a bearer credential.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token type")
+
     user = db.get(User, payload.get("sub"))
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found or inactive")
@@ -44,6 +72,10 @@ def get_current_user(
     # outliving a tenant reassignment).
     if user.tenant_id != payload.get("tenantId"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token/tenant mismatch")
+    # Revocation without a blocklist: a password change or "log out everywhere"
+    # bumps User.token_version, which strands every token minted before it.
+    if int(payload.get("tv", 0)) < int(user.token_version or 0):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token has been revoked; sign in again")
     return user
 
 
@@ -66,7 +98,15 @@ def require_role(*allowed_roles: Role):
 
 
 def hash_service_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    """Hash a service token for storage/lookup.
+
+    Single SHA-256 of a 256-bit random token. See
+    `core/security.hash_opaque_token` for why this is not PBKDF2. (The model
+    docstring previously described this as a *salted* hash, which it was not and
+    does not need to be -- a per-row salt would also make the
+    lookup-by-hash this function exists for impossible.)
+    """
+    return hash_opaque_token(token)
 
 
 def get_tenant_from_service_token(
@@ -92,27 +132,24 @@ def get_tenant_from_service_token(
     return tenant
 
 
-def enforce_ingest_quota(tenant: Tenant, db: Session, period: str) -> UsageCounter:
-    """FM10: 429 once a tenant's plan quota is exceeded for the current
-    billing period. Returns the (possibly newly created) UsageCounter row so
-    callers can increment it after a successful ingest.
+def enforce_ingest_quota(tenant: Tenant, db: Session, period: str) -> int:
+    """FM10: 429 once a tenant's plan quota is exceeded for the current period.
+
+    Returns the usage count read during the check. Incrementing is a separate,
+    atomic step (`services/billing_meter.record_event_usage`) -- this function
+    deliberately does not hand back a mutable ORM row to increment, because
+    read-here-write-later is exactly the pattern that lost increments under
+    concurrent ingest.
     """
     plan = db.get(Plan, tenant.plan_id) if tenant.plan_id else None
     quota = plan.monthly_event_quota if plan else None
 
-    counter = (
-        db.query(UsageCounter)
-        .filter(UsageCounter.tenant_id == tenant.id, UsageCounter.period == period)
-        .first()
-    )
-    if counter is None:
-        counter = UsageCounter(tenant_id=tenant.id, period=period, event_count=0)
-        db.add(counter)
-        db.flush()
+    ensure_counter(db, tenant_id=tenant.id, period=period)
+    used = read_event_usage(db, tenant_id=tenant.id, period=period)
 
-    if quota is not None and counter.event_count >= quota:
+    if quota is not None and used >= quota:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Monthly event ingestion quota ({quota}) exceeded for the current billing period.",
         )
-    return counter
+    return used

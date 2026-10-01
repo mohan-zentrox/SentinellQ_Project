@@ -39,7 +39,10 @@ from app.db.base import Base  # noqa: E402
 from app.db.seed import seed_default_plans  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.services.auth import login_rate_limiter  # noqa: E402
+from app.services.billing_provider import reset_billing_provider  # noqa: E402
 from app.services.queue import reset_queue  # noqa: E402
+from app.services.telemetry_store import reset_telemetry_store  # noqa: E402
 
 
 @pytest.fixture()
@@ -81,10 +84,16 @@ def client(db_sessionmaker, db_session) -> Generator[TestClient, None, None]:
             session.close()
 
     app.dependency_overrides[get_db] = _override_get_db
+    # Every adapter singleton is per-process; reset them so one test's backend
+    # choice or rate-limit state cannot leak into the next.
     reset_queue()
+    reset_telemetry_store()
+    reset_billing_provider()
+    login_rate_limiter.clear()
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+    login_rate_limiter.clear()
 
 
 # --------------------------------------------------------------------------
@@ -111,3 +120,46 @@ def create_service_token(client: TestClient, *, owner_token: str, name: str = "i
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["token"]
+
+
+def ingest(client: TestClient, *, service_token: str, events: list[dict]) -> dict:
+    """POST a batch to /v1/events/ingest and return the parsed response."""
+    resp = client.post(
+        "/v1/events/ingest",
+        json={"events": events},
+        headers={"X-Service-Token": service_token},
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()
+
+
+def simple_event(
+    *,
+    action: str = "login_failed",
+    category: str = "authentication",
+    severity: str = "high",
+    actor: str = "alice",
+    source_ip: str = "10.0.0.1",
+    occurred_at: str | None = None,
+    **extra,
+) -> dict:
+    payload = {
+        "eventCategory": category,
+        "eventAction": action,
+        "severity": severity,
+        "actor": actor,
+        "sourceIp": source_ip,
+    }
+    payload.update(extra)
+    body: dict = {"source": "test-collector", "payload": payload}
+    if occurred_at is not None:
+        body["occurredAt"] = occurred_at
+    return body
+
+
+def create_rule(client: TestClient, *, token: str, condition: dict, name: str = "rule", severity: str = "high", **extra) -> dict:
+    body = {"name": name, "condition": condition, "severity": severity}
+    body.update(extra)
+    resp = client.post("/v1/detection-rules", json=body, headers=auth_headers(token))
+    assert resp.status_code == 201, resp.text
+    return resp.json()

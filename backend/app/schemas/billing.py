@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import Field
 
 from app.schemas.common import CamelModel
@@ -28,6 +30,22 @@ class SubscriptionOut(CamelModel):
     tenant_id: str
     plan_id: str
     status: str
+    stripe_checkout_session_id: str | None = None
+    cancel_at_period_end: bool = False
+    canceled_at: datetime | None = None
+    current_period_end: datetime | None = None
+    created_at: datetime | None = None
+
+
+class CancelSubscriptionRequest(CamelModel):
+    """Cancel at period end by default.
+
+    Immediate cancellation would drop a paying tenant to the free quota mid-cycle
+    and start 429ing their ingestion, which is a surprising outcome for someone
+    who clicked "cancel" meaning "do not renew".
+    """
+
+    immediate: bool = False
 
 
 class UsageOut(CamelModel):
@@ -35,3 +53,14 @@ class UsageOut(CamelModel):
     event_count: int
     monthly_event_quota: int | None
     percent_used: float | None
+    #: True once usage is at or over quota: ingestion is being rejected with 429.
+    over_quota: bool = False
+
+
+class UsageHistoryEntry(CamelModel):
+    period: str
+    event_count: int
+
+
+class UsageHistoryResponse(CamelModel):
+    entries: list[UsageHistoryEntry]

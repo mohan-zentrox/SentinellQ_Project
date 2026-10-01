@@ -8,12 +8,16 @@ and tested against a stable contract before real Stripe credentials exist.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from app.core.config import get_settings
 from app.models.billing import Plan, Subscription
 from app.models.tenant import Tenant
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -69,7 +73,36 @@ class StripeProvider(BillingProvider):  # pragma: no cover - documented swap-in,
         raise NotImplementedError("Real Stripe integration is a documented extension point, see class docstring.")
 
 
+_PROVIDERS: dict[str, type[BillingProvider]] = {
+    "mock_stripe": MockStripeProvider,
+    "stripe": StripeProvider,
+}
+
+_provider_singleton: BillingProvider | None = None
+
+
 def get_billing_provider() -> BillingProvider:
-    # Swap to StripeProvider() once real Stripe credentials + webhook
-    # verification are wired up (see app.core.config.Settings.billing_provider).
-    return MockStripeProvider()
+    """Resolve the provider named by SENTINELIQ_BILLING_PROVIDER.
+
+    The setting is actually read here, so pointing a deployment at real Stripe
+    is a config change. `StripeProvider` still raises on use until its TODOs
+    are done -- which is the intended failure mode: loud, not silent.
+    """
+    global _provider_singleton
+    if _provider_singleton is None:
+        name = get_settings().billing_provider
+        try:
+            provider_cls = _PROVIDERS[name]
+        except KeyError:
+            raise ValueError(
+                f"Unknown SENTINELIQ_BILLING_PROVIDER={name!r}. Supported: {', '.join(sorted(_PROVIDERS))}."
+            ) from None
+        _provider_singleton = provider_cls()
+        logger.info("billing.provider_selected", extra={"provider": name})
+    return _provider_singleton
+
+
+def reset_billing_provider() -> None:
+    """Test helper: drop the singleton so the next call rebuilds it."""
+    global _provider_singleton
+    _provider_singleton = None

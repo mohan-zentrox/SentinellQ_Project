@@ -4,16 +4,17 @@ Password hashing uses stdlib PBKDF2-HMAC-SHA256 (no compiled-extension
 dependency such as bcrypt) so the auth stack has zero native-build risk in
 CI/containers. JWTs use PyJWT with HS256.
 
-FM1: local email+password is the *working default* auth provider. OIDC/SSO
-is a documented extension point -- see app/scaffold/sso/README.md and the
-AuthProvider interface below.
+The `AuthProvider` interface that used to live here moved to
+`app/services/auth.py`, where it sits on the real call path -- the version here
+was an abstract class whose only implementation raised NotImplementedError, so
+nothing used it. This module is now purely cryptographic primitives: no database
+access, no policy.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
 import secrets
-from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -31,6 +32,12 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, hashed: str) -> bool:
+    """Constant-time comparison against a stored PBKDF2 hash.
+
+    Returns False -- never raises -- for a malformed or empty stored hash, which
+    is what an SSO-provisioned user with no local password has. That means an
+    empty `hashed_password` can never authenticate.
+    """
     try:
         algo, iterations, salt, hexdigest = hashed.split("$")
         if algo != "pbkdf2_sha256":
@@ -43,13 +50,28 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(*, subject: str, tenant_id: str, role: str, extra_claims: dict[str, Any] | None = None) -> str:
+def create_access_token(
+    *,
+    subject: str,
+    tenant_id: str,
+    role: str,
+    token_version: int = 0,
+    extra_claims: dict[str, Any] | None = None,
+) -> str:
+    """Mint a short-lived access token.
+
+    `tv` (token version) is the revocation hook: `get_current_user` rejects a
+    token whose `tv` is behind the user's current `token_version`, so a password
+    change or "log out everywhere" invalidates outstanding access tokens without
+    maintaining a blocklist.
+    """
     settings = get_settings()
     now = datetime.now(timezone.utc)
     payload: dict[str, Any] = {
         "sub": subject,
         "tenantId": tenant_id,
         "role": role,
+        "tv": token_version,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
         "type": "access",
@@ -64,30 +86,17 @@ def decode_access_token(token: str) -> dict[str, Any]:
     return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
 
 
-# --------------------------------------------------------------------------
-# AuthProvider interface (FM1 extension point).
-#
-# LocalAuthProvider (email + password, PBKDF2 + JWT) is the working default
-# used everywhere in this repo today. A future OIDC/SSO provider (Okta,
-# Azure AD, Google Workspace, ...) can implement this same interface without
-# any changes to route handlers -- see app/scaffold/sso/README.md.
-# --------------------------------------------------------------------------
-class AuthProvider(ABC):
-    @abstractmethod
-    def authenticate(self, *, email: str, password: str) -> dict[str, Any] | None:
-        """Return a user record dict on success, None on failure."""
-        raise NotImplementedError
+def hash_opaque_token(token: str) -> str:
+    """SHA-256 for high-entropy machine tokens (service tokens, refresh tokens).
 
-    @abstractmethod
-    def issue_token(self, *, user_id: str, tenant_id: str, role: str) -> str:
-        raise NotImplementedError
+    Not PBKDF2, and that is deliberate rather than an oversight: these tokens are
+    256 bits of CSPRNG output, so there is no dictionary or brute-force threat
+    for key stretching to defend against -- only the database-disclosure case,
+    which a single hash already covers. Stretching here would add latency to
+    every ingest request for no security gain.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-class LocalAuthProvider(AuthProvider):
-    """Working default: email + PBKDF2-hashed password, stored in Postgres."""
-
-    def authenticate(self, *, email: str, password: str) -> dict[str, Any] | None:  # pragma: no cover - thin wrapper
-        raise NotImplementedError("LocalAuthProvider.authenticate is invoked via api/v1/auth.py with a DB session")
-
-    def issue_token(self, *, user_id: str, tenant_id: str, role: str) -> str:
-        return create_access_token(subject=user_id, tenant_id=tenant_id, role=role)
+def generate_opaque_token(nbytes: int = 32) -> str:
+    return secrets.token_urlsafe(nbytes)

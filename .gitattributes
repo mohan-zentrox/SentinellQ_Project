@@ -1,0 +1,26 @@
+# Normalize line endings so a checkout on Windows cannot break a Linux build.
+* text=auto
+
+# Shell scripts and Dockerfiles MUST keep LF. A CRLF checkout of
+# docker-entrypoint.sh makes the container fail at startup with
+# "bad interpreter: No such file or directory" -- the shebang line ends up with a
+# trailing \r. The same applies to anything else the images execute.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.conf text eol=lf
+docker-compose.yml text eol=lf
+
+# Lockfiles: keep LF so `npm ci` sees the same bytes on every platform.
+package-lock.json text eol=lf
+
+# Treat these as text so diffs are readable.
+*.py text
+*.ts text
+*.tsx text
+*.md text
+*.yml text
+*.yaml text
+*.json text
+*.toml text
+*.ini text
+*.mako text

@@ -22,6 +22,20 @@ ENTITY_PREFIXES: dict[str, str] = {
     "service_token": "svct",
     "timeline_entry": "tl",
     "usage_counter": "usage",
+    # Added with the modules below; generate_id() raises on an unregistered
+    # entity kind, so every new model must appear here.
+    "rule_match": "rmat",      # rule/event dedup ledger (FM4)
+    "audit": "aud",            # audit log entry
+    "refresh_token": "rft",    # auth session
+    "indicator": "ioc",        # threat intel indicator (FM5)
+    "intel_feed": "feed",      # threat intel feed config (FM5)
+    "playbook": "pb",          # SOAR playbook (FM7)
+    "playbook_run": "pbrun",   # SOAR execution record (FM7)
+    "playbook_action": "pbact",  # SOAR per-action record (FM7)
+    "ml_model": "mdl",         # ML model version (C8)
+    "report": "rpt",           # compliance report (FM9)
+    "sso_config": "sso",       # per-tenant IdP config (FM1 ext)
+    "notification": "ntf",     # notification delivery record (FM6)
 }
 
 
