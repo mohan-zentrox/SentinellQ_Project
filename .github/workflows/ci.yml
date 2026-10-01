@@ -148,20 +148,43 @@ jobs:
           cp .env.example .env
           docker compose up --build -d
 
-      - name: Wait for the backend to report ready
-        # Readiness, not liveness: this proves migrations ran and Postgres is
-        # reachable, which is what the earlier compose file silently got wrong.
+      - name: Wait for the stack to be ready
+        # Both services are polled here, and that is the point.
+        #
+        # `docker compose up -d` returns once every `depends_on` condition is
+        # satisfied -- but `frontend` depends on BACKEND health, not on its own.
+        # So compose returns as soon as the backend is healthy, with nginx still
+        # binding its socket. Asserting against port 5173 at that moment fails
+        # with `curl: (56) Recv failure: Connection reset by peer`, which reads
+        # like a broken proxy but is really a race in the test.
+        #
+        # Readiness (not liveness) for the backend: it proves migrations ran and
+        # Postgres is reachable, not merely that the process is up.
         run: |
-          for attempt in $(seq 1 60); do
-            if curl -fsS http://localhost:8000/readiness | grep -q '"status": *"ok"'; then
-              echo "backend ready"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "backend never became ready"
-          docker compose logs --no-color
-          exit 1
+          wait_for() {
+            name="$1"; url="$2"; pattern="$3"
+            for attempt in $(seq 1 60); do
+              if curl -fsS "$url" 2>/dev/null | grep -q "$pattern"; then
+                echo "$name ready after ${attempt} attempt(s)"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "$name never became ready at $url"
+            return 1
+          }
+
+          if ! wait_for backend http://localhost:8000/readiness '"status": *"ok"'; then
+            docker compose ps
+            docker compose logs --no-color
+            exit 1
+          fi
+
+          if ! wait_for frontend http://localhost:5173/ 'id="root"'; then
+            docker compose ps
+            docker compose logs --no-color frontend
+            exit 1
+          fi
 
       - name: Frontend serves the app and proxies the API
         # Guards the bug this stack had: the built bundle could not reach the
